@@ -39,19 +39,41 @@ def query_documents(question):
         embedding_function=embeddings
     )
 
-    # Step 2 - Retrieve with relevance scores so we can guard against
-    # off-topic questions before ever calling the LLM
-    results = vectorstore.similarity_search_with_relevance_scores(question, k=3)
-    for doc, score in results:
-        print(f"Score: {score:.3f} | {doc.page_content[:100]}")
-    if not results or max(score for _, score in results) < RELEVANCE_THRESHOLD:
-        return FALLBACK_ANSWER
-
-    docs = [doc for doc, _score in results]
-    context = "\n\n".join(doc.page_content for doc in docs)
-
-    # Step 3 - Initialize the LLM
+    # Step 2 - Initialize the LLM (needed for decomposition + final answer)
     llm = ChatOpenAI(model="gpt-3.5-turbo")
+
+    # Step 2a - Decompose the question into sub-questions. A single compound
+    # question (e.g. "where did income grow AND where did they invest")
+    # produces one blended embedding that matches neither topic well.
+    # Splitting it lets us retrieve separately for each part.
+    decompose_prompt = (
+        "Break the following question into 1-3 simple, standalone sub-questions "
+        "that together cover everything being asked. If the question is already "
+        "simple, just return it as-is. Return ONLY the sub-questions, one per line, "
+        "with no numbering or extra text.\n\n"
+        f"Question: {question}"
+    )
+    decomposition = llm.invoke(decompose_prompt).content
+    sub_questions = [q.strip() for q in decomposition.split("\n") if q.strip()]
+    if not sub_questions:
+        sub_questions = [question]
+
+    # Step 2b - Retrieve for each sub-question separately, then merge and
+    # dedupe. Track the best score per unique chunk for the relevance guard.
+    seen_content = {}
+    for sub_q in sub_questions:
+        sub_results = vectorstore.similarity_search_with_relevance_scores(sub_q, k=3)
+        for doc, score in sub_results:
+            key = doc.page_content
+            if key not in seen_content or score > seen_content[key][1]:
+                seen_content[key] = (doc, score)
+
+    if not seen_content or max(score for _, score in seen_content.values()) < RELEVANCE_THRESHOLD:
+        for doc, score in sorted(seen_content.values(), key=lambda x: -x[1])[:5]:
+            print(f"Score: {score:.3f} | {doc.page_content[:100]}")
+        return FALLBACK_ANSWER
+    docs = [doc for doc, _score in seen_content.values()]
+    context = "\n\n".join(doc.page_content for doc in docs)
 
     # Step 4 - Create a prompt template that explicitly forces refusal
     # when context is insufficient, rather than relying on the model's
