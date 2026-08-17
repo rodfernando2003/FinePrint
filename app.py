@@ -4,7 +4,7 @@ from query import query_documents
 st.set_page_config(page_title="Financial Services RAG", page_icon="📊")
 
 st.title("📊 Financial Services RAG")
-st.caption("Ask questions about the documents in your `data/` folder.")
+st.caption("Ask questions about Capital One's Financials")
 
 # Keep a simple chat-style history in session state
 if "history" not in st.session_state:

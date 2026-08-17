@@ -82,10 +82,12 @@ def query_documents(question):
         "You are an expert financial analyst. Answer the question using ONLY the context below.\n\n"
         "Context:\n{context}\n\n"
         "Rules:\n"
-        "- If the context does not contain enough information to answer the question, respond exactly with: "
-        f"\"{FALLBACK_ANSWER}\"\n"
+        "- Answer as fully as you can using only the context provided, even if it only "
+        "partially addresses the question.\n"
+        "- Only respond with \"" + FALLBACK_ANSWER + "\" if the context is entirely "
+        "unrelated to the question or contains nothing useful to draw from.\n"
         "- Do not use any outside knowledge, even if you know the answer.\n"
-        "- Do not speculate or guess.\n\n"
+        "- Do not invent specific numbers, dates, or facts that are not present in the context.\n\n"
         "Question: {question}\n"
         "Answer:"
     )
@@ -94,6 +96,9 @@ def query_documents(question):
     # (no need for the RunnableMap/retriever chain since we already
     # did retrieval manually above to get the relevance scores)
     prompt = promptTemplate.format(context=context, question=question)
+    # print("----- CONTEXT SENT TO LLM -----")
+    # print(context)
+    # print("--------------------------------")
     response = llm.invoke(prompt)
 
     return response.content
