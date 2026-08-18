@@ -101,7 +101,8 @@ def rewrite_with_history(question, chat_history, llm):
     'that' refers to. This rewrites the question into a standalone version
     using recent conversation history, so retrieval has something concrete
     to search for. If there's no history yet, or the question is already
-    standalone, this is a no-op (the LLM is instructed to return it as-is)."""
+    standalone, this is a no-op (the LLM is instructed to return it as-is).
+    Not streamed - this is a short, internal step the user never sees."""
     if not chat_history:
         return question
 
@@ -119,42 +120,19 @@ def rewrite_with_history(question, chat_history, llm):
     return rewritten if rewritten else question
 
 
-def query_documents(question, chat_history=None):
-    """chat_history is an optional list of (question, answer_text) tuples
-    from earlier turns in the same conversation, oldest first. Pass None
-    or [] for a fresh, single-turn query (same behavior as before)."""
-    chat_history = chat_history or []
+def _prepare_answer_prompt(question, chat_history, vectorstore, llm):
+    """Runs everything that has to happen BEFORE the final answer can be
+    generated: follow-up resolution, sub-question decomposition,
+    retrieval, and the relevance guard. None of this is streamed - it's
+    all internal groundwork the user doesn't need to watch happen token
+    by token, unlike the final answer itself.
 
-    # Step 1 - Load the existing vectorstore
-    try:
-        embeddings = OpenAIEmbeddings()
-    except ImportError as e:
-        if "socksio" in str(e) or "SOCKS" in str(e):
-            raise ImportError(
-                "Missing dependency for SOCKS proxy support. Install with: `pip install httpx[socks]`"
-            ) from e
-        raise
-    except Exception as e:
-        if not os.getenv("OPENAI_API_KEY"):
-            raise RuntimeError(
-                "OPENAI_API_KEY is not set in the environment. Set it and retry."
-            ) from e
-        raise
-
-    vectorstore = Chroma(
-        persist_directory="vectorstore/",
-        embedding_function=embeddings
-    )
-
-    llm = ChatOpenAI(model="gpt-3.5-turbo")
-
-    # Step 1b - Resolve follow-up references ("that", "it", "compared to
-    # last quarter") into a standalone question before doing anything else.
-    # Everything downstream (decomposition, retrieval, citations) uses
-    # this resolved version.
+    Returns either:
+      ("fallback", message_string)   - relevance guard rejected the question
+      ("prompt", prompt_text, citation_map) - ready for streamed generation
+    """
     standalone_question = rewrite_with_history(question, chat_history, llm)
 
-    # Step 2a - Decompose the (now standalone) question into sub-questions.
     decompose_prompt = (
         "Break the following question into 1-3 simple, standalone sub-questions "
         "that together cover everything being asked. If the question is already "
@@ -167,8 +145,6 @@ def query_documents(question, chat_history=None):
     if not sub_questions:
         sub_questions = [standalone_question]
 
-    # Step 2b - Retrieve for each sub-question separately, then merge and
-    # dedupe. Track the best score per unique chunk for the relevance guard.
     seen_content = {}
     for sub_q in sub_questions:
         sub_results = vectorstore.similarity_search_with_relevance_scores(sub_q, k=3)
@@ -178,16 +154,11 @@ def query_documents(question, chat_history=None):
                 seen_content[key] = (doc, score)
 
     if not seen_content or max(score for _, score in seen_content.values()) < RELEVANCE_THRESHOLD:
-        return build_fallback_message(vectorstore)
+        return "fallback", build_fallback_message(vectorstore), None
 
     docs = [doc for doc, _score in seen_content.values()]
     context, citation_map = format_context_with_citations(docs)
 
-    # Step 3 - Prompt includes recent conversation history so the final
-    # answer can be phrased naturally as a follow-up (e.g. "It was $2.1
-    # billion" instead of re-stating the full subject every time), while
-    # still being restricted to only the retrieved document context for
-    # any actual facts/figures.
     history_text = format_history_for_prompt(chat_history)
     history_block = f"Recent conversation:\n{history_text}\n\n" if history_text else ""
 
@@ -210,7 +181,14 @@ def query_documents(question, chat_history=None):
         "say so directly and briefly explain what the context actually covers instead "
         "(e.g. \"The provided documents don't address X; they instead cover Y.\").\n"
         "- Do not use any outside knowledge, even if you know the answer.\n"
-        "- Do not invent specific numbers, dates, or facts not present in the context.\n\n"
+        "- Do not invent specific numbers, dates, or facts not present in the context.\n"
+        "- Financial documents often contain multiple tables with identically-named rows at "
+        "different levels of aggregation (e.g. \"Total net revenue\" or \"Net income\" may appear "
+        "once for the whole company AND separately for each business segment, such as Credit "
+        "Card, Consumer Banking, or Commercial Banking). Before citing a figure, check which "
+        "table and aggregation level it comes from. If a figure is segment-specific rather than "
+        "company-wide, say so explicitly (e.g. \"Credit Card segment net revenue was...\") rather "
+        "than presenting it as a consolidated total.\n\n"
         "Question: {question}\n"
         "Answer:"
     )
@@ -220,12 +198,90 @@ def query_documents(question, chat_history=None):
         context=context,
         question=standalone_question,
     )
-    response = llm.invoke(prompt)
-    answer_text = response.content
+    return "prompt", prompt, citation_map
 
-    sources_footer = format_sources_footer(citation_map, answer_text)
 
-    return answer_text + sources_footer
+def load_vectorstore_and_llm():
+    try:
+        embeddings = OpenAIEmbeddings()
+    except ImportError as e:
+        if "socksio" in str(e) or "SOCKS" in str(e):
+            raise ImportError(
+                "Missing dependency for SOCKS proxy support. Install with: `pip install httpx[socks]`"
+            ) from e
+        raise
+    except Exception as e:
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set in the environment. Set it and retry."
+            ) from e
+        raise
+
+    vectorstore = Chroma(
+        persist_directory="vectorstore/",
+        embedding_function=embeddings
+    )
+    llm = ChatOpenAI(model="gpt-3.5-turbo")
+    return vectorstore, llm
+
+
+def prepare_answer_prompt(question, chat_history, vectorstore, llm):
+    """Public alias - see _prepare_answer_prompt for the actual logic.
+    Exposed separately (not prefixed with _) so callers like the
+    Streamlit app can run prep under a spinner and stream only the
+    generation step that follows."""
+    return _prepare_answer_prompt(question, chat_history, vectorstore, llm)
+
+
+def stream_answer_tokens(llm, prompt):
+    """Yields ONLY the answer tokens themselves, with no sources footer -
+    used when a caller wants to show prep-phase feedback (e.g. a spinner)
+    separately from the token-by-token generation that follows."""
+    for chunk in llm.stream(prompt):
+        token = chunk.content or ""
+        if token:
+            yield token
+
+
+def stream_query_documents(question, chat_history=None):
+    """Generator version of query_documents. Yields text chunks as the
+    final answer is generated, so a caller (CLI or Streamlit) can display
+    it token-by-token instead of waiting for the whole response.
+
+    Everything before the final answer (rewriting, decomposition,
+    retrieval, the relevance guard) still runs synchronously first, since
+    those steps produce short internal outputs the user doesn't watch
+    happen live - only the answer itself benefits from streaming.
+
+    On rejection (relevance guard), yields the fallback message as a
+    single chunk. On success, yields answer tokens as they arrive from
+    the LLM, followed by one final chunk containing the sources footer.
+    """
+    chat_history = chat_history or []
+    vectorstore, llm = load_vectorstore_and_llm()
+
+    kind, payload, citation_map = _prepare_answer_prompt(question, chat_history, vectorstore, llm)
+
+    if kind == "fallback":
+        yield payload
+        return
+
+    prompt = payload
+    answer_so_far = ""
+    for token in stream_answer_tokens(llm, prompt):
+        answer_so_far += token
+        yield token
+
+    sources_footer = format_sources_footer(citation_map, answer_so_far)
+    if sources_footer:
+        yield sources_footer
+
+
+def query_documents(question, chat_history=None):
+    """Non-streaming wrapper kept for callers that just want the final
+    string in one shot (e.g. tests, scripts). CLI and Streamlit use
+    stream_query_documents() directly for the live token-by-token UX."""
+    return "".join(stream_query_documents(question, chat_history=chat_history))
 
 
 if __name__ == "__main__":
@@ -237,6 +293,12 @@ if __name__ == "__main__":
             break
         if not question:
             continue
-        answer = query_documents(question, chat_history=history)
-        print(f"\nAnswer: {answer}\n")
-        history.append((question, answer))
+
+        print("\nAnswer: ", end="", flush=True)
+        full_answer = ""
+        for chunk in stream_query_documents(question, chat_history=history):
+            print(chunk, end="", flush=True)
+            full_answer += chunk
+        print("\n")
+
+        history.append((question, full_answer))
